@@ -171,6 +171,45 @@ class GitHistoryTests(unittest.TestCase):
         self.assertEqual(len(api.issue_list), 1)
         self.assertTrue(api.issue_list[0]["body"].startswith("Human notes\n"))
 
+    def test_open_fork_pr_requires_review_without_local_branch(self):
+        self.refs("main")
+        head, boundary, branches = self.analyse()
+        api = FakeGitHub()
+        api.prs.append({"number": 42, "state": "open",
+                        "head": {"ref": "feature", "repo": {"full_name": "fork/repo"}}})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            body = run("start", "main", head, boundary, branches, api, dry_run=True, repository="org/repo")
+        self.assertIn("PR #42", body)
+        self.assertIn("UNCERTAIN - REVIEW BEFORE STARTING", body)
+        self.assertIn("not available in the analysed origin refs", output.getvalue())
+        self.assertFalse(api.writes)
+
+    def test_open_pr_on_merged_branch_is_not_silently_ignored(self):
+        self.git("branch", "feature")
+        self.refs("main", "feature")
+        head, boundary, branches = self.analyse()
+        api = FakeGitHub()
+        api.create_pr("feature", "main")
+        with contextlib.redirect_stdout(io.StringIO()):
+            body = run("start", "main", head, boundary, branches, api, repository="org/repo")
+        self.assertIn("Review PR #10", body)
+        self.assertIn("UNCERTAIN", body)
+
+    def test_unrelated_branch_does_not_attempt_impossible_pr(self):
+        self.git("checkout", "--orphan", "unrelated")
+        self.git("rm", "-q", "-rf", ".")
+        self.commit("unrelated", "unrelated")
+        self.refs("main", "unrelated")
+        head, boundary, branches = self.analyse()
+        api = FakeGitHub()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            run("finish", "main", head, boundary, branches, api, repository="org/repo")
+        self.assertFalse(api.prs)
+        self.assertIn("no common ancestor", output.getvalue())
+        self.assertIn("branch `unrelated`", api.issue_list[0]["body"])
+
 
 if __name__ == "__main__":
     unittest.main()

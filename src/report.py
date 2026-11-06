@@ -42,8 +42,9 @@ def evidence(branch, default):
                     f"merge base `{branch.base[:12]}`; "
                     f"{'merged' if branch.merged else 'not merged'} into `{safe(default)}`"
                     if branch.base else "no common ancestor found; relationship unknown")
-    commits = "\n".join(f"- {safe(c)}" for c in branch.commits[:30]) or "- None identified"
-    files = "\n".join(f"- `{safe(f)}`" for f in branch.files[:50]) or "- None identified"
+    missing = "- Unknown: no common ancestor" if not branch.base else "- None identified"
+    commits = "\n".join(f"- {safe(c)}" for c in branch.commits[:30]) or missing
+    files = "\n".join(f"- `{safe(f)}`" for f in branch.files[:50]) or missing
     if len(branch.commits) > 30:
         commits += f"\n- ... {len(branch.commits) - 30} more"
     if len(branch.files) > 50:
@@ -91,6 +92,8 @@ def reconcile_comment(api, dry_run, number, name, body, comments):
     action = "update" if existing else "create"
     print(f"Would {action} {name} comment on PR #{number}" if dry_run else
           f"{action.capitalize()} {name} comment on PR #{number}")
+    if dry_run:
+        print(text)
     if not dry_run:
         if existing:
             if text != existing.get("body", ""):
@@ -106,24 +109,35 @@ def run(mode, default, head, boundary, branches, api=None, dry_run=False, reposi
         print("GitHub data unavailable: PRs, comments and issue existence are unknown.")
     print(f"FACT: {default} HEAD {head}")
     print("HEURISTIC: Settled boundary " + (boundary if boundary else "not reliably identified"))
+    def matching_prs(branch):
+        return [p for p in pulls if p.get("head", {}).get("ref") == branch.name
+                and (p.get("head", {}).get("repo") or {}).get("full_name", "").lower()
+                == (repository or "").lower()]
+
+    for branch in branches:
+        if branch.classification == "IGNORE" and any(
+                p.get("state") == "open" for p in matching_prs(branch)):
+            branch.classification = "UNCERTAIN"
     relevant = [b for b in branches if b.classification != "IGNORE"]
     ignored = len(branches) - len(relevant)
     actions = []
+    handled = set()
     for branch in relevant:
-        matches = [p for p in pulls if p.get("head", {}).get("ref") == branch.name
-                   and (p.get("head", {}).get("repo") or {}).get("full_name", "").lower()
-                   == (repository or "").lower()]
+        matches = matching_prs(branch)
         matches.sort(key=lambda p: p.get("state") != "open")
         pr = matches[0] if matches else None
+        handled.update(p["number"] for p in matches)
         if pr and branch.classification == "REVIEW" and pr.get("state") == "open":
             branch.classification = "INTEGRATE-CANDIDATE"
         print(f"\n{evidence(branch, default)}")
-        if not pr and mode == "finish":
+        if not pr and mode == "finish" and branch.base:
             if api and not dry_run:
                 pr = api.create_pr(branch.name, default)
                 print(f"Created handover PR #{pr['number']} for {branch.name}")
             else:
                 print(f"Would create handover PR for {branch.name} (if no existing PR)")
+        elif not pr and mode == "finish":
+            print(f"Cannot create a PR for {branch.name}: no common ancestor was found.")
         number = pr["number"] if pr else None
         comments = api.comments(number) if api and number else []
         if mode == "finish":
@@ -133,21 +147,44 @@ def run(mode, default, head, boundary, branches, api=None, dry_run=False, reposi
         if number and api:
             reconcile_comment(api, dry_run, number, mode, content, comments)
         elif not number:
-            print(f"Would create {mode} comment on handover PR for {branch.name}" if mode == "finish"
+            print(f"Would create {mode} comment on handover PR for {branch.name}" if mode == "finish" and branch.base
                   else f"No PR available for {branch.name}; review the branch directly.")
         target = f"PR #{number}" if number else f"branch `{safe(branch.name)}` (PR not identified)"
         actions.append(f"- [ ] {'Explain unresolved work in' if mode == 'finish' else 'Review'} {target}"
                        + (f" — {branch.classification}" if mode == "start" else ""))
+    # Fork PRs and deleted/missing branch refs are not represented in origin's refs.
+    for pr in pulls:
+        if pr.get("state") != "open" or pr["number"] in handled:
+            continue
+        number = pr["number"]
+        comments = api.comments(number)
+        head_info = pr.get("head", {})
+        source = (head_info.get("repo") or {}).get("full_name", "unknown repository")
+        facts = (f"**FACT:** Open PR #{number} from `{safe(source)}:{safe(head_info.get('ref', 'unknown'))}`.\n\n"
+                 "**UNKNOWN:** Its branch is not available in the analysed origin refs; "
+                 "commit topology, changed files, and patch equivalence have not been independently checked.")
+        if mode == "finish":
+            content = f"## FINISH MODE\n\n{facts}\n\n{QUESTIONS}"
+        else:
+            statements = human_statements(comments)
+            human = "\n".join("> " + safe(line) for text in statements
+                              for line in text[:4000].splitlines()) or "No structured outgoing-team statement found."
+            content = (f"## START MODE\n\n{facts}\n\n**HUMAN STATEMENT (unverified):**\n{human}\n\n"
+                       "**UNKNOWN:** Consistency, risk of ignoring and risk of integrating cannot be established "
+                       "without inspecting the PR. Ask a maintainer whether to integrate, preserve, or discard it.")
+        reconcile_comment(api, dry_run, number, mode, content, comments)
+        actions.append(f"- [ ] {'Explain unresolved work in' if mode == 'finish' else 'Review'} PR #{number}"
+                       + (" — UNCERTAIN" if mode == "start" else ""))
     title = "Repository handover TODO" if mode == "finish" else "Repository takeover TODO"
     if mode == "finish":
         body = (f"## Needs attention\n\n- [ ] Confirm that `{safe(default)}` is the intended handover baseline\n"
                 + "\n".join(actions) + "\n- [ ] Confirm that CI/tests pass on the intended baseline\n"
                 "- [ ] Resolve any remaining handover ambiguity")
     else:
-        assessment = ("UNCERTAIN - REVIEW BEFORE STARTING" if relevant or not api else
+        assessment = ("UNCERTAIN - REVIEW BEFORE STARTING" if actions or not api else
                       "RELIABLE WITH RESERVATIONS")
         explanation = (f"It is unclear whether `{safe(default)}` represents the intended final state. "
-                       "Review the unresolved work before substantial new development." if relevant or not api else
+                       "Review the unresolved work before substantial new development." if actions or not api else
                        f"`{safe(default)}` appears usable with reservations; confirm the intended baseline and CI.")
         body = (f"## Recommended starting point\n\n**{assessment}**\n\n{explanation}\n\n"
                 "## Needs attention\n\n" + ("\n".join(actions) or "- [ ] Confirm the baseline and CI with maintainers")

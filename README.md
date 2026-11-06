@@ -49,4 +49,6 @@ The workflow examines `origin` remote-tracking branches and the default
 branch's complete history. It does not merge, delete, force-push, rewrite
 history, or close PRs. GitHub may prevent PR creation because of repository
 settings or branch restrictions; fix the permission or review that branch
-manually.
+manually. Open fork PRs and unavailable branch refs are flagged as uncertain
+without independently inspecting their commits. Branches with no common
+ancestor require manual review because GitHub cannot create a PR for them.
